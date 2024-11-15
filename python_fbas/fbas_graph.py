@@ -18,6 +18,11 @@ class QSet:
     """
     Represents a quorum set.
     """
+    # Jay's comment: a QSet represent a quorum set, which is a set of sets of
+    # quorum slices. Validators and inner_quorum_sets are treated
+    # indifferentiably, threshold determines out of all the {validators | IQSs},
+    # how many of is needed for a valid quorum slice. The validators can be
+    # empty or not.
     threshold: int
     validators: Set[str]
     inner_quorum_sets: Set['QSet']
@@ -46,9 +51,12 @@ class FBASGraph:
     If n is a qset vertex, then it has a threshold attribute and its successors are its validators and inner qsets.
     Each vertex has optional metadata attibutes.
     """
+    # Jay commnet: there isn't any nesting limit requirement, because we are talking about transitive quorum here. there is a risk of graph getting too deep and blow up the stack though.
+    # Q. what are the meta attributes and how are they being used?    
     graph: nx.DiGraph # vertices are strings
     validators: set[str] # only a subset of the vertices in the graph represent validators
     qset_count = 1
+    # jay comment: key is just a str that represent some made up name e.g. "_q5"    
     qsets: dict[str, QSet] # maps qset vertices (str) to a description of the associated qset
 
     def __init__(self):
@@ -122,6 +130,9 @@ class FBASGraph:
         self.graph.add_node(v)
         self.validators.add(v)
 
+    # Jay comment: here `v` is actually the string representing validator
+    # this function updates the validator and its qsets in the graph. previous the validator might have already been added (as innerquorumset)
+    # but their qset info was not filled. so up till this point the validator should have no edges
     def update_validator(self, v: Any, qset: Optional[dict] = None, attrs: Optional[dict] = None) -> None:
         """
         Add the validator v to the graph if it does not exist, using the supplied qset and attributes.
@@ -144,6 +155,7 @@ class FBASGraph:
             except ValueError:
                 logging.warning("Failed to add qset %s for validator %s", qset, v)
                 return
+            # Jay quesiton: why have to remove the edgers first? this validator, if exists, should have no edge at all? unless there can be duplicate definition of the same validator?
             out_edges = list(self.graph.out_edges(v))
             self.graph.remove_edges_from(out_edges)
             self.graph.add_edge(v, fqs)
@@ -151,7 +163,7 @@ class FBASGraph:
     def add_qset(self, qset: dict) -> str:
         """
         Takes a qset as a JSON-serializable dict in stellarbeat.io format.
-        Returns the qset if it already exists, otherwise adds it to the graph.
+        Returns the qset key if it already exists, otherwise adds it to the graph and return its key.
         """
         match qset:
             case {'threshold': t, 'validators': vs, 'innerQuorumSets': iqs}:
@@ -160,10 +172,12 @@ class FBASGraph:
                     return next(k for k,v in self.qsets.items() if v == fqs)
                 iqs_vertices = [self.add_qset(iq) for iq in iqs]
                 for v in vs:
+                    # Jay comment: here we are just adding the validator to the list and the graph, do not deal with its qset yet. "update_validator" will be called later to update its qset info
                     self.add_validator(v)
                 n = "_q" + str(self.qset_count)
                 self.qset_count += 1
                 self.qsets[n] = fqs
+                # Jay question: what is this threshold used for?
                 self.graph.add_node(n, threshold=int(t))
                 for member in set(vs) | set(iqs_vertices):
                     self.graph.add_edge(n, member)
@@ -205,8 +219,9 @@ class FBASGraph:
         Create a FBASGraph from a list of validators in serialized stellarbeat.io format.
         """
         # first do some validation
-        validators = []
+        validators = [] # Jay: validators contains the full structure (publickey + quroum set)
         keys = set()
+        # Jay comment: data must be a list of validators (each with a qset definition)
         for v in data:
             if not isinstance(v, dict):
                 logging.debug("Ignoring non-dict entry: %s", v)
@@ -228,11 +243,16 @@ class FBASGraph:
                 logging.debug(
                     "Ignoring duplicate validator: %s", v['publicKey'])
                 continue
+            # Jay question: why not represent this struct in a map, which is more clear?
+            # unless a public key can correspond to multiple validators??
+            # oh the keys is just a helper for checking existence I see.
+            # Jay comment: using a single BTreeMap is simplier.
             keys.add(v['publicKey'])
             validators.append(v)
         # now create the graph:
         fbas = FBASGraph()
         for v in validators:
+            # Jay question: why add the entire v as an attribute??
             fbas.update_validator(v['publicKey'], v['quorumSet'], v)
         fbas.check_integrity()
         return fbas
@@ -364,6 +384,28 @@ class FBASGraph:
         
         To find such a set, we look inside the maximal strongly-connected component (the mscc) of the FBAS graph. First, we build a new graph over the validators in the mscc where there is an edge between v1 and v2 when v1 and v2 are intertwined, as computed by a sound but incomplete heuristic. Since the heuristic is sound, we know that any clique in this new graph is an intertwined set.
         """
+
+
+        '''
+        the idea is if a set S is interconnected, then the closure of S is also interconnected
+        the closure of S is just the set of vertices that are blocked by S
+        you walk your way bottom up, from S, find which S blocks a node, then include it, then see which new nodes is blocked by it, and so on
+        and if eventually S contains the entire set of validators, then the whole thing is interconnected
+
+        a key heuristic here is finding a "connected" set to start with. 
+        we start with the biggest strongly connected components. remove the nonvalidators. then figure out which validators are absolutely surely connected
+        this is done via a simple heuristics of checking the 1st level successors, if  N1 + N2 - (Q1+Q2) < #overlaps, then all quorums must overlap. Then we say they are connected and thus draw an edge between them. 
+        ** this is a sufficient but not necessary condition **
+        
+        from there we find all cliques the that graph
+        for each clique we compute its closure. until it includes all validators or we run out of cliques to try.
+
+        unknown is when cylic dependency happens A->B->C->A, even if they are actaully intersecting, the intersection bound heuristics will return "no"
+
+        questions/potential improvements:
+        1. better than intersection bound heuristics?
+        2. why cliques, or try better than looping over all cliques
+        '''
         # first obtain a max scc:
         mscc = max(nx.strongly_connected_components(self.graph), key=len)
         validators_with_qset = {v for v in self.validators if self.graph.out_degree(v) == 1}
