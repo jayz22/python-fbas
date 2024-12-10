@@ -1,6 +1,6 @@
 #!/bin/bash
 
-VENV=.venv
+VENV=venv
 if [ ! -d "$VENV" ]; then
     echo "Virtual environment not found. Please install python-fbas in a virtual environment first (and adjust the VENV variable in this script)."
     exit 1
